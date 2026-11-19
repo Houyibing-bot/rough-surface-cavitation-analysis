@@ -1,0 +1,117 @@
+% 生成三档粗糙表面，导出毫米制 XYZ 点云，并用同一批数据绘图。
+% 将本文件保存为 generate_and_plot_rough_surfaces.m，直接按 F5 运行。
+
+%% 1. 几何与生成参数（长度单位均为 mm）
+N = 128;
+L = 50;
+delta = [0.10, 0.40, 0.80];          % 目标样本标准差
+valley = [-0.50, -2.00, -5.00];      % 参考谷底高程
+peak   = [ 0.50,  2.00,  5.00];      % 参考峰顶高程
+bx = [12, 12, 10];                   % 流向滤波输入
+by = [12, 12, 10];                   % 展向滤波输入
+seeds = [1001, 2001, 3001];
+levels = {'slight','middle','heavy'};
+maxCycles = 10;
+tol = 0.01;
+
+coord = linspace(0,L,N);
+[X,Y] = meshgrid(coord,coord);
+Zall = zeros(N,N,3);
+Sq = zeros(1,3);
+outDir = fullfile(pwd,['rough_surfaces_' datestr(now,'yyyymmdd_HHMMSS_FFF')]);
+mkdir(outDir);
+
+%% 2. 生成点云
+for g = 1:3
+    betaX = L * bx(g) / N;
+    betaY = L * by(g) / N;
+    kernel = delta(g)^2 * exp(-2.3 * hypot(X/betaX,Y/betaY));
+
+    % 二维傅里叶变换分两个方向计算，避开本机的同名 fft2.m 脚本。
+    kernelSpectrum = builtin('fft',kernel,[],1);
+    kernelSpectrum = builtin('fft',kernelSpectrum,[],2);
+    transfer = sqrt(abs(kernelSpectrum));
+
+    previousRng = rng;
+    rng(seeds(g),'twister');
+    noise = randn(N,N);
+    rng(previousRng);
+    noiseSpectrum = builtin('fft',noise,[],1);
+    noiseSpectrum = builtin('fft',noiseSpectrum,[],2);
+    Z = builtin('ifft',transfer .* noiseSpectrum,[],1);
+    Z = real(builtin('ifft',Z,[],2));
+
+    % 依次校正峰谷差、谷底位置和样本标准差，保留末次校正后的高程。
+    targetSpan = peak(g) - valley(g);
+    for cycle = 1:maxCycles
+        zMean = mean(Z(:));
+        span = max(Z(:)) - min(Z(:));
+        Z = (Z-zMean) * (targetSpan/span) + zMean;
+        Z = Z - min(Z(:)) + valley(g);
+        zMean = mean(Z(:));
+        Z = (Z-zMean) * (delta(g)/std(Z(:),0)) + zMean;
+
+        sampleSD = std(Z(:),0);
+        actualSpan = max(Z(:)) - min(Z(:));
+        if abs(sampleSD-delta(g)) < tol*delta(g) && ...
+                abs(actualSpan-targetSpan) < tol*targetSpan
+            break
+        end
+    end
+
+    Zall(:,:,g) = Z;
+    Sq(g) = sqrt(mean((Z(:)-mean(Z(:))).^2));
+    fileName = sprintf('rough_%s_%.2fmm_seed%d_XYZ_mm.txt',levels{g},delta(g),seeds(g));
+    writematrix([X(:),Y(:),Z(:)],fullfile(outDir,fileName),'Delimiter','tab');
+    fprintf('%s  SD=%.6f  Sq=%.6f  min=%.6f  max=%.6f mm\n', ...
+        fileName,sampleSD,Sq(g),min(Z(:)),max(Z(:)));
+end
+
+%% 3. 绘图：左列为高度分布，右列为同一表面的高程
+fig = figure('Color','white','Name','Rough surface geometry','NumberTitle','off', ...
+    'Units','inches','Position',[0.5 0.5 7.6 8.6],'Visible','on');
+layout = tiledlayout(fig,3,2,'TileSpacing','compact','Padding','compact');
+colors = [36 83 126; 245 244 237; 149 63 29]/255;
+colormap(fig,interp1([0 0.5 1],colors,linspace(0,1,257),'linear'));
+
+for g = 1:3
+    Z = Zall(:,:,g);
+    z = Z(:);
+    edges = linspace(min(z),max(z),33);         % 32 个等宽区间
+    centers = (edges(1:end-1)+edges(2:end))/2;
+    pct = 100 * histcounts(z,edges) / numel(z);
+
+    axL = nexttile(layout,2*g-1);
+    bar(axL,centers,pct,1,'FaceColor',[66 118 141]/255, ...
+        'EdgeColor','white','LineWidth',0.25);
+    xlim(axL,edges([1 end]));
+    upper = max(10,2*ceil(max(pct)/2));
+    ylim(axL,[0 upper]); yticks(axL,[0 upper/2 upper]);
+    axL.YGrid = 'on';
+    xlabel(axL,'Elevation z (mm)'); ylabel(axL,'Points per bin (%)');
+    title(axL,sprintf('(%c)  Target %.2f mm','a'+g-1,delta(g)));
+
+    axR = nexttile(layout,2*g);
+    imagesc(axR,[0 L],[0 L],Z);
+    axis(axR,'image'); set(axR,'YDir','normal');
+    xlim(axR,[0 L]); ylim(axR,[0 L]);
+    xticks(axR,[0 L/2 L]); yticks(axR,[0 L/2 L]);
+    caxis(axR,[-4 4]*delta(g));                % 每行独立色标，单位 mm
+    xlabel(axR,'x (mm)'); ylabel(axR,'y (mm)');
+    title(axR,sprintf('Measured RMS height %.3f mm',Sq(g)));
+    cb = colorbar(axR);
+    cb.Ticks = [-4 0 4]*delta(g);
+    cb.Label.String = 'z (mm)';
+    set([axL axR],'FontName','Arial','FontSize',11.5,'LineWidth',0.8, ...
+        'TickDir','out','Box','off','Layer','top','GridAlpha',0.18);
+    set([axL.Title axR.Title],'FontWeight','normal','FontSize',12);
+    set(cb,'FontName','Arial','FontSize',10);
+end
+
+%% 4. 保存 600 dpi PNG 和带矢量文字、坐标轴的 PDF
+drawnow;
+exportgraphics(layout,fullfile(outDir,'rough_surface_figure.png'), ...
+    'Resolution',600,'BackgroundColor','white');
+exportgraphics(layout,fullfile(outDir,'rough_surface_figure.pdf'), ...
+    'ContentType','vector','BackgroundColor','white');
+fprintf('\n三个点云和图片均已保存至：\n%s\n',outDir);
